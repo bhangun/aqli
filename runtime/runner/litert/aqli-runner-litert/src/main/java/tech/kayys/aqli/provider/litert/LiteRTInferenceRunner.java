@@ -34,36 +34,37 @@ import tech.kayys.aqli.spi.inference.InferenceRequest;
 import tech.kayys.aqli.spi.inference.StreamingInferenceChunk;
 
 /**
- * Specialized runner for LLM models (like Gemma) using LiteRT 2.0 CompiledModel API.
+ * Specialized runner for LLM models (like Gemma) using LiteRT 2.0 CompiledModel
+ * API.
  *
- * <p>In LiteRT 2.0, the legacy TfLite Interpreter/SignatureRunner API is replaced by:
+ * <p>
+ * In LiteRT 2.0, the legacy TfLite Interpreter/SignatureRunner API is replaced
+ * by:
  * <ul>
- *   <li>{@code LiteRtCompiledModel} for model compilation and inference</li>
- *   <li>{@code LiteRtTensorBuffer} for I/O data (with lock/unlock)</li>
+ * <li>{@code LiteRtCompiledModel} for model compilation and inference</li>
+ * <li>{@code LiteRtTensorBuffer} for I/O data (with lock/unlock)</li>
  * </ul>
  *
- * <p>Note: LLM inference with KV-cache management requires the LiteRT-LM engine
+ * <p>
+ * Note: LLM inference with KV-cache management requires the LiteRT-LM engine
  * for production use. This runner provides basic autoregressive generation
  * using the standard CompiledModel API.
  */
 public class LiteRTInferenceRunner implements AutoCloseable {
 
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(LiteRTInferenceRunner.class);
-    private static final String ALLOW_NON_LITERT_FALLBACKS_PROPERTY =
-            "aqli.litert.allow_nonlitert_fallbacks";
-    private static final String PREFER_NATIVE_LITERTLM_PROPERTY =
-            "aqli.litert.prefer_native_litertlm";
-    static final String ENABLE_EXPERIMENTAL_GEMMA4_TASK_RUNNER_PROPERTY =
-            "aqli.litert.enable_experimental_gemma4_task_runner";
-    private static final Pattern GEMMA4_THOUGHT_CHANNEL =
-            Pattern.compile("^<\\|channel>thought\\n.*?<channel\\|>", Pattern.DOTALL);
-    private static final Pattern GEMMA4_GENERIC_CHANNEL_OPEN =
-            Pattern.compile("^<\\|channel>[^\\n]*\\n", Pattern.DOTALL);
-    private static final Pattern GEMMA4_ASSISTANT_TURN_OPEN =
-            Pattern.compile("^(?:<\\|turn>|<start_of_turn>)(?:model|assistant)\\s*\\r?\\n?",
-                    Pattern.CASE_INSENSITIVE);
-    private static final Pattern GEMMA4_PLAIN_ASSISTANT_LINE =
-            Pattern.compile("^(?:model|assistant)\\r?\\n+", Pattern.CASE_INSENSITIVE);
+    private static final String ALLOW_NON_LITERT_FALLBACKS_PROPERTY = "aqli.litert.allow_nonlitert_fallbacks";
+    private static final String PREFER_NATIVE_LITERTLM_PROPERTY = "aqli.litert.prefer_native_litertlm";
+    static final String ENABLE_EXPERIMENTAL_GEMMA4_TASK_RUNNER_PROPERTY = "aqli.litert.enable_experimental_gemma4_task_runner";
+    private static final Pattern GEMMA4_THOUGHT_CHANNEL = Pattern.compile("^<\\|channel>thought\\n.*?<channel\\|>",
+            Pattern.DOTALL);
+    private static final Pattern GEMMA4_GENERIC_CHANNEL_OPEN = Pattern.compile("^<\\|channel>[^\\n]*\\n",
+            Pattern.DOTALL);
+    private static final Pattern GEMMA4_ASSISTANT_TURN_OPEN = Pattern.compile(
+            "^(?:<\\|turn>|<start_of_turn>)(?:model|assistant)\\s*\\r?\\n?",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern GEMMA4_PLAIN_ASSISTANT_LINE = Pattern.compile("^(?:model|assistant)\\r?\\n+",
+            Pattern.CASE_INSENSITIVE);
 
     private final LiteRTNativeBindings bindings;
     private final Path modelPath;
@@ -84,7 +85,6 @@ public class LiteRTInferenceRunner implements AutoCloseable {
     private LiteRTGemmaMetalRunner gemmaMetalRunner;
     private LiteRTGemmaNativeRunner gemmaNativeRunner;
     private LiteRTLmJvmBridge officialJvmLmBridge;
-    private LiteRTLmPythonBridge officialLmBridge;
     private Path safetensorFallbackModelPath;
     private Path litertLmRuntimeModelPath;
     private boolean preferCompanionSafetensorFallback;
@@ -95,7 +95,7 @@ public class LiteRTInferenceRunner implements AutoCloseable {
     private int maxSeqLen = 2048;
 
     public LiteRTInferenceRunner(LiteRTNativeBindings bindings, Path modelPath,
-                                  LiteRTTokenizer tokenizer, boolean useGpu, int numThreads) {
+            LiteRTTokenizer tokenizer, boolean useGpu, int numThreads) {
         this.bindings = bindings;
         this.modelPath = modelPath;
         this.tokenizer = tokenizer;
@@ -124,7 +124,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 if (shouldPreferCompanionSafetensorFallback(runtimeModelPath)) {
                     if (allowNonLiteRtFallbacks()) {
                         this.preferCompanionSafetensorFallback = true;
-                        log.warn("Bypassing native LiteRT-LM path for {} on {} and preferring companion fallback because {}=true",
+                        log.warn(
+                                "Bypassing native LiteRT-LM path for {} on {} and preferring companion fallback because {}=true",
                                 runtimeModelPath.getFileName(),
                                 System.getProperty("os.name", "unknown"),
                                 ALLOW_NON_LITERT_FALLBACKS_PROPERTY);
@@ -137,21 +138,6 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 if (tryInitializeOfficialJvmBridge(runtimeModelPath)) {
                     return;
                 }
-                if (LiteRTLmPythonBridge.enabled()) {
-                    if (LiteRTLmPythonBridge.available()) {
-                        this.officialLmBridge = new LiteRTLmPythonBridge(runtimeModelPath, tokenizer(), useGpu);
-                        log.warn("Using official LiteRT-LM Python bridge for {} (backend={}). "
-                                        + "This path avoids the slow Java KV-cache copy fallback.",
-                                runtimeModelPath.getFileName(),
-                                LiteRTLmPythonBridge.backendName(useGpu));
-                        return;
-                    }
-                    log.warn("Official LiteRT-LM Python bridge is not available through '{}'; "
-                                    + "falling back to the slower manual LiteRT signature runner. "
-                                    + "Install Google's litert_lm package or set -D{}=false to suppress this probe.",
-                            LiteRTLmPythonBridge.pythonCommand(),
-                            LiteRTLmPythonBridge.ENABLE_PROPERTY);
-                }
                 try {
                     initializeNativeLiteRtLmFallback(runtimeModelPath);
                     return;
@@ -161,7 +147,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                         log.error(this.strictLiteRtFailureReason);
                         return;
                     }
-                    log.warn("Native LiteRT-LM runner init failed, falling back to Gemma Java runner: {}", e.getMessage());
+                    log.warn("Native LiteRT-LM runner init failed, falling back to Gemma Java runner: {}",
+                            e.getMessage());
                     this.gemmaNativeRunner = null;
                 }
             }
@@ -186,7 +173,6 @@ public class LiteRTInferenceRunner implements AutoCloseable {
 
             // 2. Create Environment for standard TFLite models
             this.environment = bindings.createEnvironment(arena);
-
 
             // Load model from file (standard .tflite or .task)
             this.model = bindings.createModelFromFile(runtimeModelPath.toAbsolutePath().toString(), arena);
@@ -251,8 +237,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
         }
         if (!LiteRTLmJvmBridge.available()) {
             log.warn("Official LiteRT-LM JVM engine is not on the runtime classpath; "
-                            + "falling back to other LiteRT-LM paths. The installed Gradle build should include "
-                            + "com.google.ai.edge.litertlm:litertlm-jvm:0.11.0 from Google Maven.");
+                    + "falling back to other LiteRT-LM paths. The installed Gradle build should include "
+                    + "com.google.ai.edge.litertlm:litertlm-jvm:0.11.0 from Google Maven.");
             return false;
         }
         try {
@@ -307,7 +293,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                     && !Boolean.getBoolean(ENABLE_EXPERIMENTAL_GEMMA4_TASK_RUNNER_PROPERTY)) {
                 Path nativeGemmaPath = findNativeGemmaLitertlm(runtimeModelPath);
                 if (nativeGemmaPath != null && !nativeGemmaPath.equals(runtimeModelPath)) {
-                    log.warn("Using native LiteRT-LM sibling {} instead of experimental Gemma 4 task runner {} on macOS",
+                    log.warn(
+                            "Using native LiteRT-LM sibling {} instead of experimental Gemma 4 task runner {} on macOS",
                             nativeGemmaPath.getFileName(),
                             runtimeModelPath.getFileName());
                     return nativeGemmaPath;
@@ -430,33 +417,35 @@ public class LiteRTInferenceRunner implements AutoCloseable {
         String base = "LiteRT cannot run " + fileName + " correctly on " + osName
                 + " in strict LiteRT mode. Non-LiteRT fallbacks are disabled, so aqli will not switch to safetensor or GGUF automatically.";
         if (cause == null || cause.getMessage() == null || cause.getMessage().isBlank()) {
-            return base + " Set -D" + ALLOW_NON_LITERT_FALLBACKS_PROPERTY + "=true only if you explicitly want cross-runtime fallback.";
+            return base + " Set -D" + ALLOW_NON_LITERT_FALLBACKS_PROPERTY
+                    + "=true only if you explicitly want cross-runtime fallback.";
         }
         return base + " Native LiteRT-LM error: " + cause.getMessage()
-                + ". Set -D" + ALLOW_NON_LITERT_FALLBACKS_PROPERTY + "=true only if you explicitly want cross-runtime fallback.";
+                + ". Set -D" + ALLOW_NON_LITERT_FALLBACKS_PROPERTY
+                + "=true only if you explicitly want cross-runtime fallback.";
     }
 
     /**
      * Generate text from a prompt using autoregressive decoding.
      *
-     * <p>This is a simplified implementation using the CompiledModel API.
+     * <p>
+     * This is a simplified implementation using the CompiledModel API.
      * For production LLM inference with KV-cache, use the LiteRT-LM engine.
      */
     public void generate(String prompt, Consumer<String> tokenCallback) {
         failIfStrictLiteRtUnavailable();
         if (preferCompanionSafetensorFallback) {
-            InferenceRequest request =
-                    InferenceRequest.builder()
-                            .requestId("litert-inline")
-                            .model(modelPath.toString())
-                            .message(Message.user(prompt == null ? "" : prompt))
-                            .temperature(0.2d)
-                            .topK(40)
-                            .topP(0.9d)
-                            .maxTokens(512)
-                            .repeatPenalty(1.1d)
-                            .streaming(false)
-                            .build();
+            InferenceRequest request = InferenceRequest.builder()
+                    .requestId("litert-inline")
+                    .model(modelPath.toString())
+                    .message(Message.user(prompt == null ? "" : prompt))
+                    .temperature(0.2d)
+                    .topK(40)
+                    .topP(0.9d)
+                    .maxTokens(512)
+                    .repeatPenalty(1.1d)
+                    .streaming(false)
+                    .build();
             generate(request, tokenCallback);
             return;
         }
@@ -523,7 +512,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 log.warn("Official LiteRT-LM bridge failed: {}. Falling back to native signature runner.",
                         e.getMessage());
                 officialLmBridge = null;
-                initializeNativeLiteRtLmFallback(litertLmRuntimeModelPath != null ? litertLmRuntimeModelPath : modelPath);
+                initializeNativeLiteRtLmFallback(
+                        litertLmRuntimeModelPath != null ? litertLmRuntimeModelPath : modelPath);
             }
         }
         if (gemmaNativeRunner != null) {
@@ -601,7 +591,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
 
             // Autoregressive loop
             for (int i = 0; i < maxNewTokens; i++) {
-                if (tokenizer().isTerminalToken(nextToken)) break;
+                if (tokenizer().isTerminalToken(nextToken))
+                    break;
 
                 String tokenStr = tokenizer().decodeToken(nextToken);
                 if (!tokenStr.isEmpty()) {
@@ -609,7 +600,7 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 }
 
                 // Feed single token for next step
-                nextToken = runInferenceStep(new int[]{nextToken}, inferArena);
+                nextToken = runInferenceStep(new int[] { nextToken }, inferArena);
             }
         } catch (Exception e) {
             log.error("Generation failed", e);
@@ -844,13 +835,13 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 "companion safetensor direct provider");
     }
 
-        private boolean tryGenerateWithCompanionGgufFallback(
+    private boolean tryGenerateWithCompanionGgufFallback(
             InferenceRequest request,
             Consumer<String> tokenCallback) {
         return false;
     }
 
-        private boolean tryGenerateWithNamedSafetensorProviderFallback(
+    private boolean tryGenerateWithNamedSafetensorProviderFallback(
             InferenceRequest request,
             Consumer<String> tokenCallback,
             String providerClassName,
@@ -866,8 +857,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
             String providerLabel) throws Exception {
         Method inferStreamMethod = provider.getClass().getMethod("inferStream", InferenceRequest.class);
         @SuppressWarnings("unchecked")
-        Multi<StreamingInferenceChunk> stream =
-                (Multi<StreamingInferenceChunk>) inferStreamMethod.invoke(provider, providerRequest);
+        Multi<StreamingInferenceChunk> stream = (Multi<StreamingInferenceChunk>) inferStreamMethod.invoke(provider,
+                providerRequest);
 
         Duration timeout = request.getTimeout().orElse(Duration.ofMinutes(5));
         AtomicBoolean leadingChannelsPending = new AtomicBoolean(true);
@@ -998,7 +989,7 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 safetensorFallbackModelPath,
                 (float) request.getRepeatPenalty());
         String strategyName = resolveSafetensorSamplingStrategy(temperature, topK, topP);
-        @SuppressWarnings({"unchecked", "rawtypes"})
+        @SuppressWarnings({ "unchecked", "rawtypes" })
         Object strategy = Enum.valueOf((Class<? extends Enum>) strategyClass.asSubclass(Enum.class), strategyName);
 
         builderClass.getMethod("maxNewTokens", int.class).invoke(builder, Math.max(1, request.getMaxTokens()));
@@ -1011,13 +1002,11 @@ public class LiteRTInferenceRunner implements AutoCloseable {
         return builderClass.getMethod("build").invoke(builder);
     }
 
-        private InferenceRequest buildSafetensorInferenceRequest(
+    private InferenceRequest buildSafetensorInferenceRequest(
             InferenceRequest request,
             boolean streaming) {
         return request;
     }
-
-    
 
     private InferenceRequest normalizeSafetensorFallbackRequest(InferenceRequest request) {
         if (request == null) {
@@ -1104,7 +1093,7 @@ public class LiteRTInferenceRunner implements AutoCloseable {
         Object builder = paramsClass.getMethod("builder").invoke(null);
         Class<?> builderClass = builder.getClass();
         Class<?> quantClass = Class.forName("tech.kayys.aqli.converter.model.QuantizationType");
-        @SuppressWarnings({"unchecked", "rawtypes"})
+        @SuppressWarnings({ "unchecked", "rawtypes" })
         Object quant = Enum.valueOf((Class<? extends Enum>) quantClass.asSubclass(Enum.class), "Q4_K_M");
 
         builderClass.getMethod("inputPath", Path.class).invoke(builder, sourceDir);
@@ -1119,7 +1108,6 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 .invoke(converter, params, null);
         return outputPath;
     }
-
 
     private String normalizeCompanionGgufName(Path sourceDir) {
         String raw = sourceDir.getFileName() != null ? sourceDir.getFileName().toString() : "model";
@@ -1223,8 +1211,8 @@ public class LiteRTInferenceRunner implements AutoCloseable {
             Path parentDir = Files.isDirectory(sourcePath) ? sourcePath : sourcePath.getParent();
             String dirHint = parentDir != null
                     ? parentDir.getFileName().toString().toLowerCase(Locale.ROOT)
-                        .replace("-litert-lm", "")
-                        .replace("-litert", "")
+                            .replace("-litert-lm", "")
+                            .replace("-litert", "")
                     : fileHint;
             List<String> hints = new ArrayList<>();
             if (!fileHint.isBlank()) {
@@ -1312,10 +1300,22 @@ public class LiteRTInferenceRunner implements AutoCloseable {
                 gemmaNativeRunner.close();
                 gemmaNativeRunner = null;
             }
-            if (compiledModel != null) { bindings.destroyCompiledModel(compiledModel); compiledModel = null; }
-            if (options != null) { bindings.destroyOptions(options); options = null; }
-            if (model != null) { bindings.destroyModel(model); model = null; }
-            if (environment != null) { bindings.destroyEnvironment(environment); environment = null; }
+            if (compiledModel != null) {
+                bindings.destroyCompiledModel(compiledModel);
+                compiledModel = null;
+            }
+            if (options != null) {
+                bindings.destroyOptions(options);
+                options = null;
+            }
+            if (model != null) {
+                bindings.destroyModel(model);
+                model = null;
+            }
+            if (environment != null) {
+                bindings.destroyEnvironment(environment);
+                environment = null;
+            }
             if (ownsTokenizer && tokenizer != null) {
                 tokenizer.close();
                 tokenizer = null;

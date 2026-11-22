@@ -122,6 +122,7 @@ import tech.kayys.aqli.cli.commands.runtime.QuantizationRunOptions;
 import tech.kayys.aqli.cli.commands.runtime.RuntimeProfileRunOptions;
 import tech.kayys.aqli.cli.commands.media.MediaMetadataRunOptions;
 import tech.kayys.aqli.cli.commands.media.MediaOutputRunOptions;
+import tech.kayys.aqli.cli.commands.presentation.RunPresentationRunOptions;
 import tech.kayys.aqli.cli.commands.diagnostics.OnnxDiagnosticsRunOptions;
 import tech.kayys.aqli.cli.commands.onnx.OnnxModelVariantRunOptions;
 import tech.kayys.aqli.cli.commands.replay.ReplayShellCommandFormatter;
@@ -171,6 +172,7 @@ public class RunCommand implements Runnable {
     private tech.kayys.aqli.cli.commands.text.TextRunOptions textRunOptions;
     private AudioRunOptions audioRunOptions;
     private GenerationSeedRunOptions generationSeedOptions;
+    private tech.kayys.aqli.cli.commands.request.ResponseCacheRunOptions responseCacheOptions;
     private FeaturePipelineRunOptions featurePipelineOptions;
     private AudioReplayRunOptions audioReplayOptions;
     private ImageGenerationRunOptions imageGenerationOptions;
@@ -198,24 +200,10 @@ public class RunCommand implements Runnable {
     private tech.kayys.aqli.cli.commands.engine.EngineSelectionRunOptions engineSelectionOptions;
     private OnnxDiagnosticsRunOptions onnxDiagnosticsOptions;
     private OnnxModelVariantRunOptions onnxModelVariantOptions;
+    private RunPresentationRunOptions presentationOptions;
 
     @Option(names = { "-m", "--model" }, description = "Model ID for repository resolution (e.g., huggingface ID)")
     public String modelId;
-
-    @Option(names = { "--no-banner" }, description = "Suppress header and footer output")
-    public boolean noBanner;
-
-    @Option(names = { "--no-info" }, description = "Suppress performance statistic output")
-    public boolean noInfo;
-
-    @Option(names = { "--only-text" }, description = "Only print generated text, equivalent to --no-banner --no-info")
-    public boolean onlyText;
-
-    @Option(names = { "--raw" }, description = "Raw response from inference calculation before json mapping")
-    public boolean raw;
-
-    @Option(names = { "--debug-prompt" }, description = "Print raw formatted prompt before dispatch, and raw vs decoded output")
-    public boolean debugPrompt;
 
     public String modelFile;
 
@@ -238,9 +226,6 @@ public class RunCommand implements Runnable {
             "--enable-json" }, description = "Emit OpenAI-compatible SSE JSON for streamed chunks", defaultValue = "false")
     boolean enableJsonSse;
 
-    @Option(names = { "--no-cache" }, description = "Bypass response cache")
-    boolean noCache;
-
     String modelPath;
 
     String convertMode;
@@ -261,9 +246,6 @@ public class RunCommand implements Runnable {
     int quantizeBits;
 
     // Stable Diffusion and TTS generation parameter.
-    @Option(names = { "--seed" }, description = "Random seed for image generation and TTS (MOSS TTS default: 1234)")
-    Long seed;
-
     String outputPath;
 
     String extension;
@@ -319,6 +301,13 @@ public class RunCommand implements Runnable {
                 GenerationSeedRunOptions.class)
                 .orElseThrow(() -> new IllegalStateException(
                         "The 'generation-seed' run capability is not registered or does not provide GenerationSeedRunOptions"));
+
+        responseCacheOptions = runCapabilityRegistry.snapshot(
+                "response-cache",
+                commandSpec.commandLine().getParseResult(),
+                tech.kayys.aqli.cli.commands.request.ResponseCacheRunOptions.class)
+                .orElseThrow(() -> new IllegalStateException(
+                        "The 'response-cache' run capability is not registered or does not provide ResponseCacheRunOptions"));
 
         audioRunOptions = runCapabilityRegistry.snapshot(
                 "audio",
@@ -515,10 +504,13 @@ public class RunCommand implements Runnable {
         direct = engineSelectionOptions.directSafetensor();
         pluginId = engineSelectionOptions.pluginId();
 
-        if (onlyText) {
-            noBanner = true;
-            noInfo = true;
-        }
+        presentationOptions = runCapabilityRegistry.snapshot(
+                "run-presentation",
+                commandSpec.commandLine().getParseResult(),
+                RunPresentationRunOptions.class)
+                .orElseThrow(() -> new IllegalStateException(
+                        "The 'run-presentation' run capability is not registered or does not provide RunPresentationRunOptions"));
+
         
         try (ExternalModelFamilyPluginScope ignored =
                 ExternalModelFamilyPluginScope.attach(
@@ -1046,7 +1038,7 @@ public class RunCommand implements Runnable {
                             conversationSessionOptions.sessionId(),
                             textRunOptions.mirostat(),
                             textRunOptions.grammar(),
-                            noCache));
+                            responseCacheOptions.bypassCache()));
 
             ModelSourceRunRequestParameterMapper.apply(
                     requestBuilder,
@@ -1187,8 +1179,8 @@ public class RunCommand implements Runnable {
                                     visionInputOptions.ocrImageTokens(),
                                     visionInputOptions.ocrRawOutput(),
                                     effectiveOnnxVariant,
-                                    raw,
-                                    debugPrompt),
+                                    presentationOptions.raw(),
+                                    presentationOptions.debugPrompt()),
                             new AudioRunRequestParameterMapper.Options(
                                     effectiveTtsVoice,
                                     effectiveTtsCodec,
@@ -1225,7 +1217,7 @@ public class RunCommand implements Runnable {
                                     effectiveSystemPrompt,
                                     ragSystemPrompt,
                                     prompt),
-                            noCache));
+                            responseCacheOptions.bypassCache()));
 
             if (!quietRouteResolutionOutput() && !enableJsonSse) {
                 uiRenderer.printModelInfo(modelId, providerId, format, null, false);
@@ -1339,9 +1331,9 @@ public class RunCommand implements Runnable {
                                                 ttftMs,
                                                 streamMetrics,
                                                 audioOutput.hasOutput(),
-                                                noBanner || noInfo,
+                                                isNoBanner() || isNoInfo(),
                                                 enableJsonSse,
-                                                noBanner);
+                                                isNoBanner());
                                     }
                                 },
                                 error -> {
@@ -1674,6 +1666,15 @@ public class RunCommand implements Runnable {
         return TtsCliOptionsValidator.effectiveFlacCompression(audioRunOptions.flacCompression(), preset, effectiveAudioFormat);
     }
 
+
+    private boolean isNoBanner() {
+        return presentationOptions.noBanner() || presentationOptions.onlyText();
+    }
+
+    private boolean isNoInfo() {
+        return presentationOptions.noInfo() || presentationOptions.onlyText();
+    }
+
     String effectiveTtsVoiceSelector() {
         return audioRunOptions.effectiveVoiceSelector();
     }
@@ -1687,7 +1688,7 @@ public class RunCommand implements Runnable {
     }
 
     private boolean quietRouteResolutionOutput() {
-        return ttsVoicesJsonOutput() || routeReportOptions.enabled() || noBanner;
+        return ttsVoicesJsonOutput() || routeReportOptions.enabled() || isNoBanner();
     }
 
     boolean shouldAllowRepositoryResolutionDuringRouteReport() {
@@ -1891,7 +1892,7 @@ public class RunCommand implements Runnable {
     }
 
     private void printQuantizationInfo() {
-        if (quantizeStrategy == null || quantizeStrategy.isBlank() || noBanner) {
+        if (quantizeStrategy == null || quantizeStrategy.isBlank() || isNoBanner()) {
             return;
         }
 
@@ -2116,16 +2117,16 @@ public class RunCommand implements Runnable {
     String[] buildStandaloneGgufStandaloneRunnerArgs(boolean suppressBanner) {
         List<String> args = new java.util.ArrayList<>();
         args.add("run");
-        if (suppressBanner || noBanner) {
+        if (suppressBanner || isNoBanner()) {
             args.add("--no-banner");
         }
-        if (noInfo) {
+        if (isNoInfo()) {
             args.add("--no-info");
         }
-        if (raw) {
+        if (presentationOptions.raw()) {
             args.add("--raw");
         }
-        if (debugPrompt) {
+        if (presentationOptions.debugPrompt()) {
             args.add("--debug-prompt");
         }
         if (modelFile != null && !modelFile.isBlank()) {
@@ -2468,7 +2469,7 @@ public class RunCommand implements Runnable {
             printQuantCacheInfo(metadata);
             printKvCacheQuantizationInfo(metadata);
             System.out.println();
-            RunResponseContentRenderer.renderText(response, raw, debugPrompt, System.out);
+            RunResponseContentRenderer.renderText(response, presentationOptions.raw(), presentationOptions.debugPrompt(), System.out);
         }
 
         boolean audioResponse = metadata.containsKey("audio") || AudioRunStatsRenderer.isAudioMetadata(metadata);
@@ -2487,9 +2488,9 @@ public class RunCommand implements Runnable {
                 tps,
                 ttftMillis(metadata),
                 audioResponse,
-                structuredOutput || noInfo || onlyText,
+                structuredOutput || isNoInfo() || presentationOptions.onlyText(),
                 enableJsonSse || jsonMode,
-                noBanner);
+                isNoBanner());
     }
 
     private static Double ttftMillis(Map<String, Object> metadata) {
@@ -2567,7 +2568,7 @@ public class RunCommand implements Runnable {
 
 
     private void printExecutionRouteInfo(Map<String, Object> metadata) {
-        ExecutionRouteTerminalRenderer.print(metadata, noBanner, System.out::println);
+        ExecutionRouteTerminalRenderer.print(metadata, isNoBanner(), System.out::println);
     }
 
     private Map<String, Object> effectiveExecutionRouteMetadata(Map<String, Object> responseMetadata) {
